@@ -132,12 +132,37 @@ def run_daily_digest(emails: list[Email], lm: LMCallable) -> str:
     * Returns a string for every model reply, and for an empty day.
     * The function does not modify ``emails``.
     * Live (tests/fixtures/digest_days.json): the digest is not empty and
-      at most 300 words (``len(digest.split())``) as the model wrote it; for
+      AT MOST 300 words (``len(digest.split())``) as the model wrote it; for
       each gold urgent email it contains the name of the company, project or
       site that email is about; it contains no term listed for the gold
       ignore emails.
     """
-    raise NotImplementedError
+
+    email_priorities = [(email, pri) for email in emails if (pri := run_priority(email, lm))["category"] != "ignore"]
+    email_priorities = [(email, pri) if pri["category"] in ["urgent", "normal"] else (email, {"category": "normal", "reason": ""}) for email, pri in email_priorities]
+    
+    label_priority = {"urgent": 0, "normal": 1, "ignore": 2, "unknown": 3}
+    email_priorities.sort(key=lambda x: label_priority.get(x[1]["category"], 3))
+
+    aggregated_emails = "\n".join((f"subject: {email['subject']}; body: {email['body']}; from: {email['from']}; recipient: {email['to']}; reply_to: {email['reply_to']}; urgency: {pri['category']}" for (email, pri) in email_priorities))
+
+    sys_prompt = {
+        'role': "system",
+        'content': '''
+        You are a helpful assistant that summarizes emails for a daily digest.
+        given an aggregated email list, ordered by urgency from most urgent to least, you should be responsible to
+        summarize a digest into AT MOST 300 words, it must list each urgent item, including key information like company, project or site that the email mentioned.
+        '''
+    }
+
+    user_prompt = {
+        'role': "user",
+        'content': f' here is the aggregated email: {aggregated_emails}, please create a digest summary for me.'
+    }
+
+    digest = lm([sys_prompt, user_prompt])
+    
+    return digest
 
 
 def run_bm25_build(docs: list[str]) -> Any:
