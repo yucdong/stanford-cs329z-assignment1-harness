@@ -22,14 +22,15 @@ where things are.
    ships, and there is no operating-system jail on Windows (see "The
    terminal sandbox" below). WSL works too and gives you the Linux jail.
 
-2. Create your `.env` file and add your API key:
+2. Create your `.env` file and choose a model backend:
 
    ```sh
    cp .env.example .env
    ```
 
-   Open `.env` and fill in `OPENROUTER_API_KEY`. The file is gitignored. Do not
-   commit it.
+   For OpenRouter (the default), fill in `OPENROUTER_API_KEY`. To use the
+   local Copilot Bridge, use the configuration below instead. The file is
+   gitignored. Do not commit it.
 
 
 3. Unpack the email archive. It ships in the repository as
@@ -40,7 +41,8 @@ where things are.
    uv run python data/download.py
    ```
 
-4. Run the tests. In the starter, every test fails with `NotImplementedError`:
+4. Run the tests. Tests that call the starter's unimplemented assignment
+   adapters fail with `NotImplementedError` until you implement them:
 
    ```sh
    uv run pytest
@@ -48,6 +50,74 @@ where things are.
 
 Run every command from the repository root with `uv run`. The first
 `uv run` creates the environment in `.venv/`.
+
+## Using the local Copilot Bridge
+
+This local development adaptation keeps the `LM(messages) -> str` interface.
+OpenRouter uses Chat Completions; Copilot Bridge uses streaming Responses at
+`POST /codex/responses`. Changing only an API key or setting
+`OPENAI_BASE_URL` does not switch this wrapper's backend.
+
+With the bridge already running on the Windows host, set these in `.env`:
+
+```dotenv
+CS329Z_LLM_BACKEND=copilot_bridge
+CS329Z_BRIDGE_BASE_URL=http://127.0.0.1:8765/codex
+CS329Z_BRIDGE_API_KEY=local-bridge
+CS329Z_GRADING_MODEL=gpt-6-luna
+CS329Z_USER_MODEL=gpt-6-luna
+CS329Z_JUDGE_MODEL=gpt-6-sol
+CS329Z_REASONING_EFFORT=low
+CS329Z_CACHE_DIR=.lm_cache/copilot-bridge
+```
+
+The bridge handles GitHub/Copilot authentication. `local-bridge` is a
+non-secret SDK placeholder, not a GitHub token. If bridge authentication is
+enabled, replace it with the bridge's own credential. `OPENROUTER_API_KEY`
+may remain in `.env`; bridge mode never uses it. Model IDs are passed as
+configured, without adding or removing a provider prefix. Without model
+overrides, bridge mode defaults to the three unprefixed IDs shown above.
+The bridge URL, placeholder key and cache directory above are also defaults.
+
+Keep the SDK version in `uv.lock`; no extra dependency is required:
+
+```sh
+uv sync --locked
+uv run --locked pytest tests/test_llm_backends.py
+```
+
+The backend tests use fake HTTP/SSE responses and make no model calls. For a
+real connectivity check that bypasses the response cache, run:
+
+```sh
+uv run --locked python -c "from cs329z_hw1.llm import LM; lm = LM(cache=False, tag='bridge-smoke'); print(lm([{'role': 'user', 'content': 'Reply with OK only.'}])); print(lm.usage())"
+```
+
+Use `LM('user', cache=False)` or `LM('judge', cache=False)` to check the other
+roles. `usage()` and the ledger include the returned model ID because bridge
+routing can change it. Requests consume upstream quota; a model appearing in
+the catalog alone does not prove that inference works. The catalog is at
+`http://127.0.0.1:8765/codex/models?client_version=0.147.0`; this bridge does
+not expose the standard `/v1/models` or `/v1/chat/completions` paths.
+
+Bridge mode keeps its ledger and replies under `.lm_cache/copilot-bridge/`.
+The cache and parameter-compatibility records distinguish backend, endpoint,
+protocol and model. When the bridge omits cost, the ledger records
+`cost_usd=0` with `cost_source="unreported"`; this does not mean inference is
+free. Missing token counts are recorded as zero with `usage_reported=false`.
+The spending report identifies both cases. `CS329Z_BUDGET_USD` limits recorded
+dollar spending and cannot measure or enforce Copilot subscription quota.
+
+To switch back, set `CS329Z_LLM_BACKEND=openrouter`, supply
+`OPENROUTER_API_KEY`, and remove the three model overrides and
+`CS329Z_CACHE_DIR` override. This restores the original OpenRouter models
+and `.lm_cache/` ledger. Restart the command after changing `.env`;
+existing process environment variables take precedence over `.env`.
+
+This adaptation changes the course-provided `llm.py`, which grading replaces.
+It does not implement the assignment's adapters; their `NotImplementedError`
+failures are independent of backend connectivity. The wrapper continues to
+use text-based tool protocols, without native API tool calls.
 
 ## Tests
 
@@ -108,20 +178,21 @@ All model calls go through `cs329z_hw1.llm.LM`: a list of
 ```python
 from cs329z_hw1.llm import LM
 
-lm = LM()            # the grading model, openai/gpt-6-luna
-judge = LM("judge")  # the evaluation's judge model, openai/gpt-6-sol
+lm = LM()            # grading role (OpenRouter default: openai/gpt-6-luna)
+judge = LM("judge")  # judge role (OpenRouter default: openai/gpt-6-sol)
 text = lm([{"role": "user", "content": "Say hello."}])
 ```
 
 The wrapper does three things:
 
-- **Cache.** Each reply is stored under `.lm_cache/`, keyed on the model,
-  the sampling settings and the exact messages. Repeating an identical call
-  returns the stored reply and costs nothing.
+- **Cache.** Each reply is stored under the backend's cache directory, keyed
+  on the backend, endpoint, protocol, model, sampling settings and exact
+  messages. Repeating an identical call returns the stored reply and costs
+  nothing.
 - **Ledger.** Each call that reaches the provider is appended to
-  `.lm_cache/ledger.jsonl` with its token counts and cost. Print the totals
-  by model and by tag (the test suite tags each call with the test name)
-  with:
+  the cache directory's `ledger.jsonl` with its token counts and cost. Print
+  the totals by model and by tag (the test suite tags each call with the test
+  name) with:
 
   ```sh
   uv run python -m cs329z_hw1.llm

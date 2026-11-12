@@ -27,6 +27,7 @@ of this call.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Optional
 
 from cs329z_hw1.types import (
@@ -61,7 +62,64 @@ def run_priority(email: Email, lm: LMCallable) -> dict:
     * The function does not raise and does not modify ``email``.
     * Live: at least 85% agreement with tests/fixtures/priority_gold.json.
     """
-    raise NotImplementedError
+
+    sys_prompt = {'role': "system", "content": '''
+    You are an expert email classifying agent, your task is to classify the emails based on the rules given below.
+    1. Classify the email into one of the following categories: "urgent", "normal", "ignore", or "unknown".
+    2. Provide a reason for the classification.
+    3. If the email does not contain any of the keywords for the first three categories, classify it as "unknown".
+    4. Ensure the reason is a non-empty string.
+    5. definitions of the categories:
+       - "urgent": The email asks the recipient todo something, or reports a live problem the recipient is responsible for, usually the action is needed the same day, the next working
+ day,or by a stated deadline at most two working days away. or the tone of the email is very urgent.
+       - "normal": Mail written for this recipient or a small working group, with no deadline in the next two working days: status updates, questions, documents for review, scheduling, and personal notes from people the recipient knows and the tone is not urgent.
+       - "ignore": Mail the recipient can leave unread: advertising, newsletters announcements to large employee lists, and automated notifications that ask nothing of the recipient.
+       - "unknown": The email does not match any of the above categories.
+
+    Some common knowledge: wording does not decide the label, a mass mailing that says "act now" is ignore,
+    an email with "URGENT" in the subject that asks nothing of the recipient is not urgent, an automated notice that
+    asks this recipient to act is normal, or urgent if its deadline is within two working days.
+    '''}
+
+    user_prompt = {'role': "user", 'content': f'''
+    The email to classify is as follows:
+
+    from: {email['from']}
+    recipients: {email['to']}
+    reply_to: {email['reply_to']}
+    date: {email['date']}
+    subject: {email['subject']}
+    body: {email['body']}
+
+    Respond with a JSON object containing only "category" and "reason". here is an example:
+    
+    {{
+        "category": "urgent",
+        "reason": "The email asks the recipient to complete a task by tomorrow."
+    }}
+    do not output reasoning trace, or characters outside the JSON object should be included. just output the json value
+    '''}
+
+    response = lm([sys_prompt, user_prompt])
+    try:
+      result = json.loads(response)
+      if (
+          isinstance(result, dict)
+          and "category" in result
+          and "reason" in result
+          and isinstance(result["category"], str)
+          and isinstance(result["reason"], str)
+      ):
+          result["category"] = result["category"].strip().lower()
+          result["reason"] = result["reason"].strip().lower()
+          return result
+      else:
+          return {
+              "category": "unknown",
+              "reason": "Missing or invalid category or reason.",
+          }    
+    except json.JSONDecodeError:
+      return {"category": "unknown", "reason": "Invalid JSON response from model"}
 
 
 def run_daily_digest(emails: list[Email], lm: LMCallable) -> str:

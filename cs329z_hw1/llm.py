@@ -1,6 +1,6 @@
 """Course-provided language model wrapper.
 
-This module gives you exactly one primitive: a chat-completion call that takes
+This module gives you exactly one primitive: a model call that takes
 a list of messages and returns a string.
 
     lm = LM()                                  # the grading model
@@ -12,9 +12,9 @@ are yours to build on top of this call.
 
 What the wrapper does for you:
 
-* Disk cache. Every call is cached under ``.lm_cache/`` keyed on the model,
-  the sampling settings, and the exact messages. Re-running unchanged code
-  costs nothing.
+* Disk cache. Every call is cached under ``.lm_cache/`` keyed on the backend,
+  endpoint, model, sampling settings, and exact messages. Re-running unchanged
+  code costs nothing.
 * Cost ledger. Every call that reaches the provider is appended to
   ``.lm_cache/ledger.jsonl`` with its token counts and dollar cost.
   ``uv run python -m cs329z_hw1.llm`` prints a spending report.
@@ -27,6 +27,11 @@ What the wrapper does for you:
 
 ``ScriptedLM`` is a drop-in fake used by the deterministic tests. It replays a
 fixed list of replies and never touches the network.
+
+OpenRouter is the default backend. ``CS329Z_LLM_BACKEND=copilot_bridge`` uses
+the bridge's streaming Responses endpoint and defaults to a separate cache
+and ledger under ``.lm_cache/copilot-bridge``. Unreported bridge costs are
+recorded as zero with ``cost_source="unreported"``, not estimated charges.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -52,10 +58,11 @@ DEFAULT_MODELS = {
     "judge": "openai/gpt-6-sol",  # scores evaluation transcripts
 }
 
-# Calls go to OpenRouter, which fronts many providers behind one
+# By default, calls go to OpenRouter, which fronts many providers behind one
 # OpenAI-compatible API. Model names carry the provider as a prefix
 # ("openai/gpt-6-luna"); https://openrouter.ai/models lists them.
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
+BRIDGE_URL = "http://127.0.0.1:8765/codex"
 
 # Reasoning effort requested from models that accept it (GPT-5 and GPT-6).
 # Override with CS329Z_REASONING_EFFORT.
@@ -64,8 +71,8 @@ DEFAULT_REASONING_EFFORT = "low"
 # USD per 1M tokens: (input, cached input, output), keyed by the model name
 # without its provider prefix. OpenRouter reports the exact cost of each
 # call in the response, and the ledger records that; this table is the
-# fallback for a response without one, and it is checked when an LM is
-# created so that an unknown model fails before a paid call. Read from
+# fallback for an OpenRouter response without one, and it is checked when an
+# OpenRouter LM is created so an unknown model fails before a paid call. Read from
 # https://openrouter.ai/models on 2026-10-05 (the same as OpenAI's list
 # prices).
 PRICES = {
@@ -130,7 +137,10 @@ def resolve_model(role_or_model: str | None = None) -> str:
     """
     name = role_or_model or "grading"
     if name in DEFAULT_MODELS:
-        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", DEFAULT_MODELS[name])
+        default = DEFAULT_MODELS[name]
+        if _backend() == "copilot_bridge":
+            default = default.removeprefix("openai/")
+        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", default)
     return name
 
 
@@ -154,8 +164,20 @@ def cost_usd(model: str, input_tokens: int, cached_tokens: int, output_tokens: i
     return (fresh * p_in + cached_tokens * p_cached + output_tokens * p_out) / 1_000_000
 
 
+def _backend() -> str:
+    backend = os.environ.get("CS329Z_LLM_BACKEND", "openrouter")
+    if backend not in {"openrouter", "copilot_bridge"}:
+        raise ValueError(
+            f"Unknown CS329Z_LLM_BACKEND {backend!r}; use 'openrouter' or 'copilot_bridge'."
+        )
+    return backend
+
+
 def _cache_dir() -> Path:
-    return Path(os.environ.get("CS329Z_CACHE_DIR", REPO_ROOT / ".lm_cache"))
+    default = REPO_ROOT / ".lm_cache"
+    if _backend() == "copilot_bridge":
+        default /= "copilot-bridge"
+    return Path(os.environ.get("CS329Z_CACHE_DIR", default))
 
 
 def _load_env() -> None:
@@ -169,12 +191,12 @@ def _load_env() -> None:
 _ledger_lock = threading.Lock()
 # Models that reject the temperature or reasoning_effort parameters, learned
 # from the provider's error the first time each is used.
-_NO_TEMPERATURE: set[str] = set()
-_NO_EFFORT: set[str] = set()
+_NO_TEMPERATURE: set[tuple[str, ...]] = set()
+_NO_EFFORT: set[tuple[str, ...]] = set()
 
 
-def read_ledger() -> list[dict]:
-    path = _cache_dir() / "ledger.jsonl"
+def read_ledger(cache_dir: Path | None = None) -> list[dict]:
+    path = (cache_dir if cache_dir is not None else _cache_dir()) / "ledger.jsonl"
     if not path.exists():
         return []
     rows = []
@@ -188,12 +210,12 @@ def read_ledger() -> list[dict]:
     return rows
 
 
-def total_spend() -> float:
-    return sum(row.get("cost_usd", 0.0) for row in read_ledger())
+def total_spend(cache_dir: Path | None = None) -> float:
+    return sum(row.get("cost_usd", 0.0) for row in read_ledger(cache_dir))
 
 
-def _append_ledger(row: dict) -> None:
-    path = _cache_dir() / "ledger.jsonl"
+def _append_ledger(row: dict, cache_dir: Path | None = None) -> None:
+    path = (cache_dir if cache_dir is not None else _cache_dir()) / "ledger.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with _ledger_lock:
         with open(path, "a", encoding="utf-8") as f:
@@ -220,8 +242,8 @@ class LM:
     Parameters
     ----------
     model:
-        A role ("grading", "user", "judge"), an OpenRouter model name such
-        as "openai/gpt-6-sol", or ``None`` for "grading".
+        A role ("grading", "user", "judge"), a model ID accepted by the
+        selected backend, or ``None`` for "grading".
     temperature, max_tokens:
         Sampling settings. They are part of the cache key. Reasoning models
         spend part of ``max_tokens`` on hidden reasoning, so keep it large.
@@ -247,8 +269,19 @@ class LM:
         salt: str = "",
     ) -> None:
         _load_env()
+        self.backend = _backend()
+        self.api_type = "responses" if self.backend == "copilot_bridge" else "chat_completions"
+        self.base_url = (
+            (os.environ.get("CS329Z_BRIDGE_BASE_URL") or BRIDGE_URL).rstrip("/")
+            if self.backend == "copilot_bridge" else OPENROUTER_URL
+        )
         self.model = resolve_model(model)
-        _price(self.model)  # fail now, not after a paid call, if the price is unknown
+        if self.backend == "openrouter":
+            _price(self.model)  # fail before a paid call if the price is unknown
+        self._endpoint_key = (self.backend, self.base_url, self.api_type, self.model)
+        self._cache_directory = _cache_dir()
+        self.reasoning_effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+        self.response_model: str | None = None
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.tag = tag
@@ -269,19 +302,28 @@ class LM:
         _validate_messages(messages)
         messages = [{"role": m["role"], "content": m["content"]} for m in messages]
         key = self._key(messages)
-        path = _cache_dir() / key[:2] / f"{key}.json"
+        path = self._cache_directory / key[:2] / f"{key}.json"
         self.calls += 1
         if self.cache and path.exists():
             self.cached_calls += 1
-            return json.loads(path.read_text(encoding="utf-8"))["text"]
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            self.response_model = cached.get("response_model", self.model)
+            return cached["text"]
 
         self._check_budget()
         start = time.time()
         text, usage = self._complete(messages)
         elapsed = time.time() - start
+        self.response_model = usage.get("response_model", self.model)
         cost = usage.get("cost")
+        cost_source = "reported"
         if cost is None:
-            cost = cost_usd(self.model, usage["input"], usage["cached"], usage["output"])
+            if self.backend == "openrouter":
+                cost = cost_usd(self.model, usage["input"], usage["cached"], usage["output"])
+                cost_source = "estimated"
+            else:
+                cost = 0.0
+                cost_source = "unreported"
         self.input_tokens += usage["input"]
         self.output_tokens += usage["output"]
         self.cost_usd += cost
@@ -291,14 +333,22 @@ class LM:
             {
                 "ts": round(start, 3),
                 "model": self.model,
+                "response_model": self.response_model,
+                "backend": self.backend,
+                "base_url": self.base_url,
+                "api_type": self.api_type,
                 "tag": self.tag or os.environ.get("CS329Z_TAG", ""),
                 "input_tokens": usage["input"],
                 "cached_tokens": usage["cached"],
                 "output_tokens": usage["output"],
+                "reasoning_tokens": usage.get("reasoning", 0),
+                "usage_reported": usage.get("usage_reported", True),
                 "cost_usd": cost,
+                "cost_source": cost_source,
                 "seconds": round(elapsed, 3),
                 "finish_reason": usage.get("finish_reason"),
-            }
+            },
+            self._cache_directory,
         )
         if truncated:  # charged and logged, never cached
             raise OutputTruncated(
@@ -311,7 +361,10 @@ class LM:
         if self.cache and text.strip():  # an empty reply is not worth remembering
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-            tmp.write_text(json.dumps({"text": text, "model": self.model}), encoding="utf-8")
+            tmp.write_text(
+                json.dumps({"text": text, "model": self.model, "response_model": self.response_model}),
+                encoding="utf-8",
+            )
             tmp.replace(path)
         return text
 
@@ -319,6 +372,8 @@ class LM:
         """Totals for this instance since it was created."""
         return {
             "model": self.model,
+            "backend": self.backend,
+            "response_model": self.response_model,
             "calls": self.calls,
             "cached_calls": self.cached_calls,
             "input_tokens": self.input_tokens,
@@ -330,9 +385,8 @@ class LM:
     # -- internals --------------------------------------------------------
 
     def _key(self, messages: list[Message]) -> str:
-        effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
         blob = json.dumps(
-            [self.model, self.temperature, self.max_tokens, effort, self.salt, messages],
+            [self._endpoint_key, self.temperature, self.max_tokens, self.reasoning_effort, self.salt, messages],
             sort_keys=True,
             ensure_ascii=False,
         )
@@ -342,7 +396,7 @@ class LM:
         cap = os.environ.get("CS329Z_BUDGET_USD")
         if not cap:
             return
-        spent = total_spend()
+        spent = total_spend(self._cache_directory)
         if spent >= float(cap):
             raise BudgetExceeded(
                 f"Spent ${spent:.2f} of the ${float(cap):.2f} cap set by CS329Z_BUDGET_USD. "
@@ -353,18 +407,26 @@ class LM:
         if self._client is None:
             from openai import OpenAI
 
-            key = os.environ.get("OPENROUTER_API_KEY")
+            key = (
+                os.environ.get("CS329Z_BRIDGE_API_KEY") or "local-bridge"
+                if self.backend == "copilot_bridge" else os.environ.get("OPENROUTER_API_KEY")
+            )
             if not key:
                 raise RuntimeError(
                     "OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key."
                 )
             self._client = OpenAI(
-                base_url=OPENROUTER_URL,
+                base_url=self.base_url,
                 api_key=key,
                 max_retries=6,
                 timeout=120,
-                default_headers={"X-Title": "CS329Z HW1"},
+                default_headers={"X-Title": "CS329Z HW1"} if self.backend == "openrouter" else {},
             )
+        if self.backend == "copilot_bridge":
+            return self._complete_responses(messages)
+        return self._complete_openrouter(messages)
+
+    def _complete_openrouter(self, messages: list[Message]) -> tuple[str, dict]:
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -373,43 +435,157 @@ class LM:
             # that the response carry the cost of the call.
             "extra_body": {"usage": {"include": True}},
         }
-        if self.model not in _NO_TEMPERATURE:
+        if self._endpoint_key not in _NO_TEMPERATURE:
             kwargs["temperature"] = self.temperature
-        effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
-        if effort and self.model not in _NO_EFFORT:
-            kwargs["extra_body"]["reasoning"] = {"effort": effort}
-        try:
-            response = self._client.chat.completions.create(**kwargs)
-        except Exception as exc:  # some models reject temperature or reasoning effort
-            text = str(exc)
-            if "temperature" in text and "temperature" in kwargs:
-                _NO_TEMPERATURE.add(self.model)
-                kwargs.pop("temperature")
-                response = self._client.chat.completions.create(**kwargs)
-            elif "reasoning" in text and "reasoning" in kwargs["extra_body"]:
-                _NO_EFFORT.add(self.model)
-                kwargs["extra_body"].pop("reasoning")
-                response = self._client.chat.completions.create(**kwargs)
-            else:
-                raise
+        if self.reasoning_effort and self._endpoint_key not in _NO_EFFORT:
+            kwargs["extra_body"]["reasoning"] = {"effort": self.reasoning_effort}
+        response = self._request_with_fallback(self._client.chat.completions.create, kwargs)
         choice = response.choices[0]
         text = choice.message.content or ""
-        u = response.usage
-        details = getattr(u, "prompt_tokens_details", None)
-        cached = getattr(details, "cached_tokens", 0) or 0
-        out_details = getattr(u, "completion_tokens_details", None)
-        reasoning = getattr(out_details, "reasoning_tokens", 0) or 0
-        usage = {
-            "input": u.prompt_tokens,
-            "cached": cached,
-            "output": u.completion_tokens,
-            "reasoning": reasoning,
-            "finish_reason": getattr(choice, "finish_reason", None),
-        }
-        cost = getattr(u, "cost", None)  # OpenRouter's figure for this call
-        if isinstance(cost, (int, float)):
-            usage["cost"] = float(cost)
+        usage = _normalize_usage(response.usage, responses=False)
+        usage.update(finish_reason=choice.finish_reason, response_model=response.model)
         return text, usage
+
+    def _complete_responses(self, messages: list[Message]) -> tuple[str, dict]:
+        if not hasattr(self._client, "responses"):
+            raise RuntimeError(
+                "The installed OpenAI SDK does not support Responses. "
+                "Run 'uv sync --locked' and use 'uv run --locked' for this project."
+            )
+        kwargs: dict = {
+            "model": self.model,
+            "input": messages,
+            "stream": True,
+            "store": False,
+            "max_output_tokens": self.max_tokens,
+        }
+        if self._endpoint_key not in _NO_TEMPERATURE:
+            kwargs["temperature"] = self.temperature
+        if self.reasoning_effort and self._endpoint_key not in _NO_EFFORT:
+            kwargs["reasoning"] = {"effort": self.reasoning_effort}
+        response = self._request_with_fallback(self._read_response, kwargs)
+        parts = []
+        for item in response.output:
+            if item.type == "reasoning":
+                continue
+            if item.type != "message":
+                raise RuntimeError(f"Unexpected Responses output {item.type!r}; LM expects text only.")
+            for part in item.content:
+                if part.type == "output_text":
+                    parts.append(part.text)
+                elif part.type == "refusal":
+                    parts.append(part.refusal)
+                else:
+                    raise RuntimeError(f"Unexpected Responses content {part.type!r}.")
+        usage = _normalize_usage(response.usage, responses=True)
+        usage.update(
+            finish_reason="length" if response.status == "incomplete" else "stop",
+            response_model=response.model,
+        )
+        return "".join(parts), usage
+
+    def _read_response(self, **kwargs):
+        terminal = None
+        output_seen = False
+        # Errors can arrive during iteration, not just during create().
+        with self._client.responses.create(**kwargs) as stream:
+            for event in stream:
+                if event.type == "error":
+                    raise _ResponsesError(event.model_dump(), retryable=not output_seen)
+                if event.type == "response.failed":
+                    error = event.response.error
+                    raise _ResponsesError(
+                        error.model_dump() if error else {"message": "Responses request failed."},
+                        retryable=not output_seen,
+                    )
+                if event.type in {"response.completed", "response.incomplete"}:
+                    terminal = event.response
+                    output_seen = True
+                    if event.type != f"response.{terminal.status}":
+                        raise RuntimeError(f"Unexpected Responses terminal status: {terminal.status!r}.")
+                    if terminal.status == "incomplete":
+                        reason = getattr(terminal.incomplete_details, "reason", None)
+                        if reason != "max_output_tokens":
+                            raise RuntimeError(f"Responses request incomplete: {reason!r}.")
+                elif event.type.startswith("response.output_") or event.type.endswith(".delta"):
+                    output_seen = True
+        if terminal is None:
+            raise RuntimeError("Responses stream ended without a terminal response.")
+        return terminal
+
+    def _request_with_fallback(self, request: Callable, kwargs: dict):
+        # Each removal can happen only once. Never drop the output limit or
+        # retry a stream that has already started producing output.
+        while True:
+            try:
+                return request(**kwargs)
+            except Exception as exc:
+                parameter = _unsupported_parameter(exc)
+                reasoning_options = kwargs.get("extra_body", kwargs)
+                if parameter == "temperature" and "temperature" in kwargs:
+                    _NO_TEMPERATURE.add(self._endpoint_key)
+                    kwargs.pop("temperature")
+                elif parameter == "reasoning" and "reasoning" in reasoning_options:
+                    _NO_EFFORT.add(self._endpoint_key)
+                    reasoning_options.pop("reasoning")
+                else:
+                    raise
+
+
+class _ResponsesError(RuntimeError):
+    def __init__(self, body: dict, *, retryable: bool):
+        self.body = body
+        self.retryable = retryable
+        super().__init__(f"Responses stream failed: {body.get('message') or body.get('code') or 'unknown error'}")
+
+
+def _unsupported_parameter(exc: Exception) -> str | None:
+    """Only explicit parameter rejections may change a request and retry."""
+    from openai import APIStatusError
+
+    if isinstance(exc, _ResponsesError):
+        if not exc.retryable:
+            return None
+    elif not isinstance(exc, APIStatusError) or exc.status_code not in {400, 422}:
+        return None
+    body = exc.body
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error", body)
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    message = str(error.get("message", "")).lower()
+    if code not in {"unsupported_parameter", "unsupported_value"} and not any(
+        phrase in message for phrase in ("not supported", "unsupported", "does not support", "only the default")
+    ):
+        return None
+    parameter = str(error.get("param") or "").split(".", 1)[0]
+    if parameter in {"temperature", "reasoning", "reasoning_effort"}:
+        return "reasoning" if parameter.startswith("reasoning") else parameter
+    if parameter:  # An explicit rejection of some other field is not ours to fix.
+        return None
+    mentioned = [p for p in ("temperature", "reasoning") if re.search(rf"\b{p}(?:_effort)?\b", message)]
+    return mentioned[0] if len(mentioned) == 1 else None
+
+
+def _normalize_usage(u, *, responses: bool) -> dict:
+    input_field, output_field = ("input_tokens", "output_tokens") if responses else ("prompt_tokens", "completion_tokens")
+    input_tokens = getattr(u, input_field, None)
+    output_tokens = getattr(u, output_field, None)
+    details = getattr(u, f"{input_field}_details", None)
+    out_details = getattr(u, f"{output_field}_details", None)
+    usage = {
+        "input": input_tokens or 0,
+        "cached": getattr(details, "cached_tokens", 0) or 0,
+        "output": output_tokens or 0,
+        "reasoning": getattr(out_details, "reasoning_tokens", 0) or 0,
+        "usage_reported": input_tokens is not None and output_tokens is not None,
+    }
+    cost = getattr(u, "cost", None)
+    if isinstance(cost, (int, float)):
+        usage["cost"] = float(cost)
+    return usage
 
 
 class ScriptedLM:
@@ -517,8 +693,15 @@ def spending_report(rows: list[dict] | None = None) -> str:
     total = sum(r.get("cost_usd", 0.0) for r in rows)
     cut = sum(r.get("finish_reason") == "length" for r in rows)
     lines.append(f"Total: {len(rows)} calls, ${total:.3f}" + (f"; {cut} cut off at max_tokens" if cut else ""))
+    unpriced = sum(r.get("cost_source") == "unreported" for r in rows)
+    uncounted = sum(r.get("usage_reported") is False for r in rows)
+    if unpriced:
+        lines.append(f"Cost unreported for {unpriced} calls (recorded as $0; not a measure of Copilot quota or charges).")
+    if uncounted:
+        lines.append(f"Token usage missing or incomplete for {uncounted} calls (missing counts recorded as 0).")
     return "\n".join(lines)
 
 
 if __name__ == "__main__":  # uv run python -m cs329z_hw1.llm
+    _load_env()
     print(spending_report())
