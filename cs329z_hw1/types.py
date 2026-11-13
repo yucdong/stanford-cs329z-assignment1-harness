@@ -12,9 +12,13 @@ AgentConfig, AgentResult, and the rest) is an object with attributes.
 
 from __future__ import annotations
 
+from collections import UserDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, TypedDict
+
+import cs329z_hw1
+from cs329z_hw1 import tokenizer
 
 
 Message = dict  # {"role": "system" | "user" | "assistant", "content": str}
@@ -38,6 +42,23 @@ class Email(TypedDict):
     subject: str
     body: str
 
+class Index(UserDict):
+    # store [term -> dict[docid, count]] for each token
+    def __init__(self, docs: list[str]):
+        self.document_count = len(docs)
+        self.document_lengths = dict[int, int]()
+        super().__init__()
+        for idx, doc in enumerate(docs):
+            tokens = tokenizer.tokenize(doc)
+            self.document_lengths[idx] = len(tokens)
+            for token in tokens:
+                if token not in self.data:
+                    self.data[token] = defaultdict[int, int](int)
+                self.data[token][idx] += 1
+        self.avg_doc_len = sum(self.document_lengths.values()) / self.document_count if self.document_count > 0 else 0
+
+    def __missing__(self, key: str):
+        return defaultdict(int)
 
 # ---------------------------------------------------------------- tools ----
 

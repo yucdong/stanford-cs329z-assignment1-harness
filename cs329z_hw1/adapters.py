@@ -27,9 +27,14 @@ of this call.
 
 from __future__ import annotations
 
+from collections import defaultdict
 import json
+import math
+import types
 from typing import Any, Callable, Optional
 
+import cs329z_hw1
+from cs329z_hw1 import tokenizer
 from cs329z_hw1.types import (
     AgentConfig,
     DocWindow,
@@ -165,7 +170,7 @@ def run_daily_digest(emails: list[Email], lm: LMCallable) -> str:
     return digest
 
 
-def run_bm25_build(docs: list[str]) -> Any:
+def run_bm25_build(docs: list[str]) -> cs329z_hw1.types:
     """Problem (bm25).
 
     Build and return a BM25 index over ``docs``. Document ids are list
@@ -175,10 +180,23 @@ def run_bm25_build(docs: list[str]) -> Any:
     back to ``run_bm25_search``. The index over the archive must build in
     under 15 seconds.
     """
-    raise NotImplementedError
+    index = cs329z_hw1.types.Index(docs)
+    return index
 
 
-def run_bm25_search(index: Any, query: str, k: int) -> list[tuple[int, float]]:
+def bm25_calculate(index: cs329z_hw1.types.Index, docid: int, idf_t: float, term_docs: dict[int, int]) -> float:
+    k1 = 1.5
+    b = 0.75
+    if len(term_docs) > 0:
+        f_t_d = term_docs.get(docid, 0)
+        doc_len = index.document_lengths[docid]
+        avg_doc_len = index.avg_doc_len
+        return idf_t * f_t_d * (k1 + 1) / (f_t_d + k1 * (1 - b + b * doc_len / avg_doc_len))
+    else:
+        return 0.0
+
+
+def run_bm25_search(index: cs329z_hw1.types.Index, query: str, k: int) -> list[tuple[int, float]]:
     """Problem (bm25).
 
     Return the top-k ``(doc_id, score)`` pairs for ``query`` as
@@ -196,8 +214,27 @@ def run_bm25_search(index: Any, query: str, k: int) -> list[tuple[int, float]]:
       query on average over the archive, and 2 ms for a term that occurs in
       3 of 200,000 documents.
     """
-    raise NotImplementedError
+    if len(query.strip()) == 0:
+        return []
+    terms = set([token for token in tokenizer.tokenize(query.strip().lower())])
+    documents = [set(index[term].keys()) for term in terms]
 
+    if all(len(item) == 0 for item in documents):
+        return []
+    candidates = set.union(*documents)
+    
+    doc_scores = defaultdict(lambda: 0.0)
+    for term in terms:
+        # term frequency only need to be calculated once.
+        term_docs = index[term]
+        term_len =  len(term_docs)
+        term_idf = math.log1p((index.document_count - term_len + 0.5) / (term_len + 0.5))
+        term_doc_candidates = set(term_docs.keys()) & candidates
+        for docid in term_doc_candidates:
+            doc_scores[docid] += bm25_calculate(index, docid, term_idf, term_docs)
+    doc_scores = list(doc_scores.items())
+    doc_scores.sort(key=lambda x: (-x[1], x[0]))
+    return doc_scores[:k]
 
 def run_email_qa(
     question: str,
