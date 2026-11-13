@@ -236,6 +236,28 @@ def run_bm25_search(index: cs329z_hw1.types.Index, query: str, k: int) -> list[t
     doc_scores.sort(key=lambda x: (-x[1], x[0]))
     return doc_scores[:k]
 
+def rewrite_email_qa_query(
+    question: str,
+    suggestion: str,
+    lm: LMCallable
+) -> str:
+    sys_prompt = {
+        'role': 'system',
+        'content': '''
+        You are an expert email assistant, we are not able to answer the question based on the search results from the question, give the previous 
+        question and a feedback suggestion from LLM, please rewrite the question to be more clear and concise so we cal recall more relevant context
+        and try to answer the question again. just give the rewritten question, do not including reasoning or markers
+        '''
+    }
+
+    user_prompt = {
+        'role': 'user',
+        'content': f"Question: {question}\nSuggestion: {suggestion}"
+    }
+
+    response = lm([sys_prompt, user_prompt])
+    return response
+
 def run_email_qa(
     question: str,
     search: Callable[[str, int], list[Email]],
@@ -259,7 +281,69 @@ def run_email_qa(
       contain an accepted answer, and the ``support`` of every correct
       answer includes at least one gold email.
     """
-    raise NotImplementedError
+    n_recall = 32
+    for i in range(3):
+      relative_emails = search(question, n_recall)
+      # candidate_emails = (email for email in relative_emails if email not in previous_emails)
+      candidate_emails = relative_emails
+      support = [email["id"] for email in candidate_emails]
+      if not candidate_emails:
+          question = rewrite_email_qa_query(question, "failed to recall related content from search engine, please refine the question wording.", lm)
+          continue
+      
+      sys_prompt = {
+          'role': 'system',
+          'content': '''
+          You are an expert email assistant. Answer the question based on the provided email context. and return a boolean fulfilled variable
+          of value true or false to indicate
+          if the context is enough to answer the question. and give suggestion in answer field if you cannot find the answer in the given context,
+          we will refine the question based on your suggestion.
+
+          Respond with a JSON object containing only "answer" and "fulfilled". here is an example:
+              
+            {{
+                "answer": "Coldharbor Inn",
+                "fulfilled": true
+            }}
+
+            and a negative example:
+              
+            {{
+                "answer": 'The context doesn’t say where Tobias Hallqvist is staying during the plant visit, please include keywords like (tobias stay plant visit hotel trip vacation) in your search query',
+                "fulfilled": false
+            }}
+          '''
+      }
+
+      context = "\n".join([f"From: {email['from']}\nTo: {email['to']}\nreply_to: {email['reply_to']}\ndate: {email['date']}\nSubject: {email['subject']}\n\n{email['body']}" for email in candidate_emails])
+      user_prompt = {
+          'role': 'user',
+          'content': f"Question: {question}\n\nContext:\n{context}\n\nAnswer the question based on the context above."
+      }
+
+      response = lm([sys_prompt, user_prompt])
+      try:
+        result = json.loads(response)
+        if (
+            isinstance(result, dict)
+            and "answer" in result
+            and "fulfilled" in result
+            and isinstance(result["answer"], str)
+            and isinstance(result["fulfilled"], bool)
+        ):
+            if bool(result["fulfilled"]) == True:
+              return {
+                  "answer": result["answer"],
+                  "support": support
+              }
+            else:
+              if i != 2:
+                  question = rewrite_email_qa_query(question, result["answer"], lm)
+              continue
+      except json.JSONDecodeError:
+        continue
+      
+    return {"answer": None, "support": []}
 
 
 # ======================================================================
