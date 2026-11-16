@@ -43,6 +43,8 @@ from cs329z_hw1.types import (
     ParsedResponse,
     SearchResult,
     ToolCall,
+    ToolResult,
+    ToolRegistry,
     ToolSpec,
 )
 
@@ -349,8 +351,7 @@ def run_email_qa(
 # ======================================================================
 # Part 2: the Cardinal Agent
 # ======================================================================
-
-
+        
 def run_tool_registry(tools: list[ToolSpec]) -> Any:
     """Problem (tool_registry).
 
@@ -375,7 +376,7 @@ def run_tool_registry(tools: list[ToolSpec]) -> Any:
       ``fn(**args)``: status "ok", ``content == str(return value)``.
     * The registry keeps working after any of these outcomes.
     """
-    raise NotImplementedError
+    return ToolRegistry(tools)
 
 
 def run_render_tools(schemas: list[dict]) -> str:

@@ -64,7 +64,6 @@ class Index(UserDict):
 
 Status = Literal["ok", "unknown_tool", "invalid_args", "tool_error", "denied"]
 
-
 @dataclass
 class ToolSpec:
     """Everything the registry stores about one tool."""
@@ -87,6 +86,35 @@ class ToolResult:
     status: Status
     content: str
 
+class ToolRegistry:
+    def __init__(self, tools: list[ToolSpec]):
+      self.tools = dict((tool.name, tool) for tool in tools)
+
+    def schemas(self) -> list[dict]:
+      return [{"name": name, "description": spec.description, "parameters": spec.parameters} for name, spec in self.tools.items()]
+    
+    def validate(self, name: str, args: dict) -> ToolResult | None:
+      if name not in self.tools:
+          return ToolResult(status="unknown_tool", content=f"tool {name} not in registry")
+      spec = self.tools[name]
+      schema = spec.parameters
+      from jsonschema import validate as json_validate, ValidationError
+      try:
+          json_validate(instance=args, schema=schema)
+      except ValidationError as e:
+          return ToolResult(status="invalid_args", content=str(e))
+      return None
+
+    def execute(self, name: str, args: dict) -> ToolResult:
+      validate_result = self.validate(name, args)
+      if validate_result is None:
+         try:
+             result = self.tools[name].fn(**args)
+             return ToolResult(status="ok", content=str(result))
+         except Exception as e:
+             return ToolResult(status="tool_error", content=str(e))
+      else:
+         return validate_result
 
 @dataclass
 class ParsedResponse:
