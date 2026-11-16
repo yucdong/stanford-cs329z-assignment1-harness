@@ -28,6 +28,7 @@ of this call.
 from __future__ import annotations
 
 from collections import defaultdict
+import dataclasses
 import json
 import math
 import types
@@ -388,7 +389,18 @@ def run_render_tools(schemas: list[dict]) -> str:
     this text, the model must write a correct call for at least 18 of the 20
     requests in tests/fixtures/agent_protocol_requests.json.
     """
-    raise NotImplementedError
+    tools_prompt = json.dumps(schemas, ensure_ascii=False, indent=2)
+    
+    return f'''
+    Here are the available tools, their descriptions and their parameters:
+    {tools_prompt},
+    write a tool call in the format of
+    <tool_call>
+    {{"name": "search", "args": {{"query": "meeting tomorrow", "limit": 5, "enabled": true, "filter": null}}}}
+    </tool_call>
+
+    do not write multiple tool calls in one reply and keep the xml tag and args json payload intact
+    '''
 
 
 def run_parse_response(text: str) -> ParsedResponse:
@@ -408,7 +420,8 @@ def run_parse_response(text: str) -> ParsedResponse:
       is exactly the original call, never a different one. If the cut is
       inside the arguments, ``tool_call`` is None and ``error`` is set.
     """
-    raise NotImplementedError
+    text, call, error = ToolCodec.extract_tool_call(text)
+    return ParsedResponse(text=text, tool_call=call, error=error)
 
 
 def run_format_tool_call(text: str, call: ToolCall) -> str:
@@ -427,8 +440,64 @@ def run_format_tool_call(text: str, call: ToolCall) -> str:
       complete call in your own format.
     * ``call`` is not modified.
     """
-    raise NotImplementedError
+    return f'''
+    {text}
+    {ToolCodec.serialize_tool_call(call)}
+    '''
 
+class ToolCodec:
+    START = "<tool_call>"
+    END = "</tool_call>"
+
+    @staticmethod
+    def serialize_tool_call(call: ToolCall) -> str:
+        payload = json.dumps(
+            dataclasses.asdict(call),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return f"{ToolCodec.START}{payload}{ToolCodec.END}"
+
+    @staticmethod
+    def extract_tool_call(text: str) -> tuple[str, ToolCall | None, str | None]:
+        start_idx = text.find(ToolCodec.START)
+        end_idx = text.find(ToolCodec.END, start_idx)
+        if start_idx == -1:
+            return text, None, None
+        json_start = start_idx + len(ToolCodec.START)
+        while json_start < len(text) and text[json_start].isspace():
+            json_start += 1
+
+        try:
+            payload, json_end = json.JSONDecoder().raw_decode(text, json_start)
+        except json.JSONDecodeError as exc:
+            return text, None, f"malformed tool call: {exc}"
+
+        # JSON 解析完后，才检查外层结束标记
+        end_idx = json_end
+        while end_idx < len(text) and text[end_idx].isspace():
+            end_idx += 1
+
+        if not text.startswith(ToolCodec.END, end_idx):
+            return text, None, "missing tool call end tag"
+
+        call_end = end_idx + len(ToolCodec.END)
+
+        # check text after the tool call for additional start tags
+        if text.find(ToolCodec.START, call_end) != -1:
+            return text, None, "more than one tool call"
+
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("name"), str)
+            or not isinstance(payload.get("args"), dict)
+        ):
+            return text, None, "invalid tool call structure"
+
+        call = ToolCall(name=payload["name"], args=payload["args"])
+        new_text = text[:start_idx] + text[call_end:]
+
+        return new_text.strip(), call, None
 
 def run_agent_session(
     lm: LMCallable,
