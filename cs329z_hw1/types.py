@@ -171,6 +171,7 @@ class AgentConfig:
 
     # Problem (agent_loop)
     max_turns: int = 20  # model calls allowed per user message
+    max_malformed: int = 3  # max consecutive malformed replies
     token_budget: int = 400_000  # tokens allowed per user message
     # Problem (compaction)
     context_budget: int = 16_000  # max tokens in any one LM call's messages

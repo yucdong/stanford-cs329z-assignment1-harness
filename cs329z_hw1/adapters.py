@@ -28,6 +28,7 @@ of this call.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 import dataclasses
 import json
 import math
@@ -36,13 +37,17 @@ from typing import Any, Callable, Optional
 
 import cs329z_hw1
 from cs329z_hw1 import tokenizer
+from cs329z_hw1.llm import OutputTruncated
+from cs329z_hw1.tokens import count_message_tokens, count_tokens
 from cs329z_hw1.types import (
     AgentConfig,
+    AgentResult,
     DocWindow,
     Email,
     LMCallable,
     ParsedResponse,
     SearchResult,
+    StopReason,
     ToolCall,
     ToolResult,
     ToolRegistry,
@@ -353,7 +358,7 @@ def run_email_qa(
 # Part 2: the Cardinal Agent
 # ======================================================================
         
-def run_tool_registry(tools: list[ToolSpec]) -> Any:
+def run_tool_registry(tools: list[ToolSpec]) -> ToolRegistry:
     """Problem (tool_registry).
 
     Return your registry populated with ``tools``, in that order. The tests
@@ -499,6 +504,107 @@ class ToolCodec:
 
         return new_text.strip(), call, None
 
+class AgentSession:
+
+    def __init__(self, lm: LMCallable, tools: Optional[list[ToolSpec]], config: AgentConfig):
+        self.lm = lm
+        self.tools = tools
+        self.tool_registry = run_tool_registry(tools)
+        self.config = config
+        self.tools_prompt = run_render_tools(self.tool_registry.schemas())
+        self.system_prompt = {
+            "role": "system",
+            "content": f'''
+              You are an intelligent agent, please help the user accomplish their tasks, you need to think, consider the tools
+              you can use, reason about what actions to take, use tools to get more information, and think again, and finally you can
+              reach an answer, the tools for you to use is below:
+
+              {self.tools_prompt}
+              '''
+        }
+
+        self.messages = []
+        self.transcript = []
+        self.mode = "auto"
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+
+    # The transcript is an append-only list of event dicts. It is a log, not the
+    # model's context: compaction changes what you send to the model and never
+    # removes events from the transcript. Our tests read these event types:
+    #
+    #   {"type": "user",        "content": str}
+    #   {"type": "assistant",   "content": str}               # raw model reply
+    #   {"type": "tool_call",   "name": str, "args": dict}
+    #   {"type": "tool_result", "name": str, "status": Status, "content": str}
+    #
+    # "content" of a tool_result is exactly the ToolResult.content you showed the
+    # model. A reply that could not be parsed produces an "assistant" event and
+    # then a {"type": "error", "content": str} event holding the message you sent
+    # back. You may append events of other types (for example "compaction"); the
+    # tests ignore types they do not know.
+    def send(self, user_message: str) -> AgentResult:
+        num_calls = 0
+        malformed_count = 0
+        total_tokens = 0
+        self.messages.append({"role": "user", "content": user_message})
+        self.transcript.append({"type": "user", "content": user_message})
+
+        def finish(status: StopReason, text: str) -> AgentResult:
+            return AgentResult(
+                status=status, text=text, transcript=deepcopy(self.transcript)
+            )
+
+        while True:
+            if total_tokens >= self.config.token_budget:
+                return finish("token_budget", "Stopped because the token budget was reached.")
+            if num_calls >= self.config.max_turns:
+                return finish("max_turns", "Stopped because the maximum number of model calls was reached.")
+
+            # Count the exact messages sent, including the system prompt.
+            messages = [self.system_prompt, *self.messages]
+            input_tokens = count_message_tokens(messages)
+            num_calls += 1
+            error = None
+            try:
+                response = self.lm(messages)
+            except OutputTruncated as e:
+                response = e.text
+                error = f"Output truncated: {e}"
+
+            total_tokens += input_tokens + count_tokens(response)
+            self.messages.append({"role": "assistant", "content": response})
+            self.transcript.append({"type": "assistant", "content": response})
+
+            # A truncated response is never executed, even if its prefix parses.
+            if error is None:
+                parsed_response = run_parse_response(response)
+                error = parsed_response.error
+
+            if error is not None:
+                self.transcript.append({"type": "error", "content": error})
+                self.messages.append({"role": "user", "content": error})
+                malformed = True
+            elif parsed_response.tool_call is not None:
+                call = parsed_response.tool_call
+                self.transcript.append({
+                    "type": "tool_call", "name": call.name, "args": deepcopy(call.args)
+                })
+                tool_result = self.tool_registry.execute(call.name, call.args)
+                self.transcript.append({
+                    "type": "tool_result", "name": call.name,
+                    "content": tool_result.content, "status": tool_result.status,
+                })
+                self.messages.append({"role": "user", "content": tool_result.content})
+                malformed = tool_result.status in ("unknown_tool", "invalid_args")
+            else:
+                return finish("done", parsed_response.text or "The model returned an empty answer.")
+
+            malformed_count = malformed_count + 1 if malformed else 0
+            if malformed_count >= self.config.max_malformed:
+                return finish("malformed", "Stopped after repeated consecutive malformed replies.")
+
 def run_agent_session(
     lm: LMCallable,
     tools: Optional[list[ToolSpec]],
@@ -612,7 +718,7 @@ def run_agent_session(
     * Nothing in a tool result changes the mode, the approval policy or
       the deny rules.
     """
-    raise NotImplementedError
+    return AgentSession(lm, tools, config)
 
 
 def run_build_doc_index(docs: list[dict]) -> Any:
