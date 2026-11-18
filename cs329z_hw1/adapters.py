@@ -37,7 +37,7 @@ from typing import Any, Callable, Optional
 
 import cs329z_hw1
 from cs329z_hw1 import tokenizer
-from cs329z_hw1.cardinal import CARDINAL_SPECS, CARDINAL_TOOLS
+from cs329z_hw1.cardinal import CARDINAL_SPECS, USER_SPECS, MEMORY_DIR_SPECS
 from cs329z_hw1.llm import OutputTruncated
 from cs329z_hw1.tokens import count_message_tokens, count_tokens
 from cs329z_hw1.types import (
@@ -721,6 +721,11 @@ def run_agent_session(
     """
     if tools is None:
         tools = CARDINAL_SPECS
+    else:
+        if config.user is not None:
+            tools.extend(USER_SPECS)
+        if config.memory_dir is not None:
+            tools.extend(MEMORY_DIR_SPECS)
     return AgentSession(lm, tools, config)
 
 

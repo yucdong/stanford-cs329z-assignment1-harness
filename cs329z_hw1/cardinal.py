@@ -146,6 +146,15 @@ def ask_user(question: str) -> Any:
     pass
 
 
+MEMORY_DIR_SPECS = [
+    cardinal_spec("remember", "Remember the given fact.", remember),
+    cardinal_spec("recall", "Recall information based on the given query.", recall),
+]
+
+USER_SPECS = [
+    cardinal_spec("ask_user", "Ask the user the given question.", ask_user),
+]
+
 CARDINAL_SPECS = [
     cardinal_spec("search_emails", "Search emails with the given query and return up to k results.", search_emails),
     cardinal_spec("read_email", "Read the email with the given ID.", read_email),
@@ -154,7 +163,6 @@ CARDINAL_SPECS = [
     cardinal_spec("search_docs", "Search documents with the given query and return up to k results.", search_docs),
     cardinal_spec("read_doc", "Read the document with the given ID starting from the specified line.", read_doc),
     cardinal_spec("run_terminal", "Run the given terminal command.", run_terminal),
-    cardinal_spec("remember", "Remember the given fact.", remember),
-    cardinal_spec("recall", "Recall information based on the given query.", recall),
-    cardinal_spec("ask_user", "Ask the user the given question.", ask_user),
+    *MEMORY_DIR_SPECS,
+    *USER_SPECS,
 ]
