@@ -37,6 +37,7 @@ from typing import Any, Callable, Optional
 
 import cs329z_hw1
 from cs329z_hw1 import tokenizer
+from cs329z_hw1.cardinal import CARDINAL_SPECS, CARDINAL_TOOLS
 from cs329z_hw1.llm import OutputTruncated
 from cs329z_hw1.tokens import count_message_tokens, count_tokens
 from cs329z_hw1.types import (
@@ -505,7 +506,7 @@ class ToolCodec:
         return new_text.strip(), call, None
 
 class AgentSession:
-
+    
     def __init__(self, lm: LMCallable, tools: Optional[list[ToolSpec]], config: AgentConfig):
         self.lm = lm
         self.tools = tools
@@ -718,6 +719,8 @@ def run_agent_session(
     * Nothing in a tool result changes the mode, the approval policy or
       the deny rules.
     """
+    if tools is None:
+        tools = CARDINAL_SPECS
     return AgentSession(lm, tools, config)
 
 
