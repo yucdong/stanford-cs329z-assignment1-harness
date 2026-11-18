@@ -15,6 +15,7 @@ description (the text the model reads to decide when and how to call it).
 from __future__ import annotations
 
 import copy
+from threading import Lock
 from typing import Any, Callable
 
 from cs329z_hw1.types import ToolSpec
@@ -105,6 +106,29 @@ def cardinal_spec(name: str, description: str, fn: Callable[..., Any]) -> ToolSp
         read_only=entry["read_only"],
     )
 
+_doc_index = None
+_doc_index_lock = Lock()
+
+
+def get_doc_index():
+    """Load and build the shared document index on the first tool call."""
+    global _doc_index
+
+    with _doc_index_lock:
+        if _doc_index is None:
+            # adapters imports cardinal's specs, so defer the reverse import
+            # until both modules have finished initializing.
+            from cs329z_hw1.adapters import run_build_doc_index
+            from cs329z_hw1.data import load_docs
+
+            _doc_index = run_build_doc_index(load_docs())
+        return _doc_index
+
+
+def build_index_if_needed() -> None:
+    """Initialize the document index without rebuilding an existing one."""
+    get_doc_index()
+
 def search_emails(query: str, k: int = 5) -> Any:
     """Search emails with the given query and return up to k results."""
     pass
@@ -123,11 +147,15 @@ def daily_digest(date: str) -> Any:
 
 def search_docs(query: str, k: int = 5) -> Any:
     """Search documents with the given query and return up to k results."""
-    pass
+    from cs329z_hw1.adapters import run_search_docs
+
+    return run_search_docs(get_doc_index(), query, k)
 
 def read_doc(doc_id: str, start_line: int = 1) -> Any:
     """Read the document with the given ID starting from the specified line."""
-    pass
+    from cs329z_hw1.adapters import run_read_doc
+
+    return run_read_doc(get_doc_index(), doc_id, start_line)
 
 def run_terminal(cmd: str) -> Any:
     """Run the given terminal command."""

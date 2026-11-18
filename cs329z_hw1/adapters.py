@@ -32,14 +32,15 @@ from copy import deepcopy
 import dataclasses
 import json
 import math
+import re
 import types
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 import cs329z_hw1
 from cs329z_hw1 import tokenizer
 from cs329z_hw1.cardinal import CARDINAL_SPECS, USER_SPECS, MEMORY_DIR_SPECS
 from cs329z_hw1.llm import OutputTruncated
-from cs329z_hw1.tokens import count_message_tokens, count_tokens
+from cs329z_hw1.tokens import CHARS_PER_TOKEN, count_message_tokens, count_tokens
 from cs329z_hw1.types import (
     AgentConfig,
     AgentResult,
@@ -729,7 +730,46 @@ def run_agent_session(
     return AgentSession(lm, tools, config)
 
 
-def run_build_doc_index(docs: list[dict]) -> Any:
+def _chunk_doc_text(text: str, max_tokens: int = 150) -> list[str]:
+    """Pack sentences into chunks using the course's character-based token count."""
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+
+    # English periods end sentences before whitespace/EOF; Chinese periods
+    # need no following space. This avoids splitting decimal numbers and URLs.
+    sentences = re.split(r"(?<=。)|(?<=\.)(?=\s|$)", text.strip())
+    max_chars = max_tokens * CHARS_PER_TOKEN
+    chunks = []
+    pending = ""
+    for sentence in sentences:
+        if not sentence:
+            continue
+        if count_tokens(pending + sentence) <= max_tokens:
+            pending += sentence
+            continue
+
+        if pending.strip():
+            chunks.append(pending.strip())
+        pending = ""
+        sentence = sentence.lstrip()
+
+        # Oversized sentences fall back to whitespace boundaries; a single
+        # oversized word (or unspaced text) must be split at the hard limit.
+        while count_tokens(sentence) > max_tokens:
+            cut = max_chars
+            boundaries = list(re.finditer(r"\s+", sentence[:max_chars + 1]))
+            if boundaries and boundaries[-1].start() > 0:
+                cut = boundaries[-1].start()
+            chunks.append(sentence[:cut].strip())
+            sentence = sentence[cut:].lstrip()
+        pending = sentence
+
+    if pending.strip():
+        chunks.append(pending.strip())
+    return chunks
+
+
+def run_build_doc_index(docs: list[dict]) -> Tuple[dict, dict, list, cs329z_hw1.types.Index]:
     """Problem (search_docs). Index the company documents.
 
     ``docs`` is what ``cs329z_hw1.data.load_docs()`` returns: one dict per
@@ -739,10 +779,22 @@ def run_build_doc_index(docs: list[dict]) -> Any:
     it to both; your ``search_docs`` and ``read_doc`` tools should build it
     the first time a tool needs it and share it.
     """
-    raise NotImplementedError
+    docid_mapping = {doc['doc_id']: {
+        'title': doc['title'],
+        'lines': doc['text'].splitlines(),
+        'chunks': _chunk_doc_text(doc['text'])
+    } for doc in docs}
+
+    index_chunks = []
+    chunk_to_docid_mapping = {}
+    for docid in docid_mapping.keys():
+        for chunk_idx, chunk in enumerate(docid_mapping[docid]['chunks']):
+            index_chunks.append(chunk)
+            chunk_to_docid_mapping[len(index_chunks) - 1] = docid
+    return docid_mapping, chunk_to_docid_mapping, index_chunks, cs329z_hw1.types.Index(index_chunks)
 
 
-def run_search_docs(index: Any, query: str, k: int = 5) -> list[SearchResult]:
+def run_search_docs(index: Tuple[dict, dict, cs329z_hw1.types.Index], query: str, k: int = 5) -> list[SearchResult]:
     """Problem (search_docs). Search the documents in ``index``.
 
     Rules the tests check:
@@ -756,10 +808,20 @@ def run_search_docs(index: Any, query: str, k: int = 5) -> list[SearchResult]:
       document and its snippet contains the word.
     * The same call returns the same results every time.
     """
-    raise NotImplementedError
+    idx_docid_mapping = index[0]
+    chunk_to_docid_mapping = index[1]
+    chunks = index[2]
+    bm25_index = index[3]
+    results = run_bm25_search(bm25_index, query, k)
+    search_results = []
+    for chunk_idx, _ in results:
+        doc_id = chunk_to_docid_mapping[chunk_idx]
+        snippet = chunks[chunk_idx]
+        search_results.append(SearchResult(doc_id=doc_id, title=idx_docid_mapping[doc_id]['title'], snippet=snippet))
+    return search_results
 
 
-def run_read_doc(index: Any, doc_id: str, start_line: int = 1) -> DocWindow:
+def run_read_doc(index: Tuple[dict, dict, list,  cs329z_hw1.types.Index], doc_id: str, start_line: int = 1) -> DocWindow:
     """Problem (search_docs). Read a bounded window of one document in ``index``.
 
     Lines are those of ``text.splitlines()`` for the document's text in
@@ -775,4 +837,17 @@ def run_read_doc(index: Any, doc_id: str, start_line: int = 1) -> DocWindow:
     * An unknown ``doc_id``, or a ``start_line`` outside
       ``1..total_lines``, raises ValueError or LookupError.
     """
-    raise NotImplementedError
+    idx_docid_mapping = index[0]
+    chunk_to_docid_mapping = index[1]
+    chunks = index[2]
+    bm25_index = index[3]
+    totallines = len(idx_docid_mapping[doc_id]['lines'])
+    if start_line < 1 or start_line > totallines:
+        raise ValueError("start_line out of range")
+    end_line = start_line - 1
+    text_lines = []
+    while end_line < totallines and count_tokens("\n".join(text_lines)) + count_tokens(idx_docid_mapping[doc_id]['lines'][end_line]) < 1500:
+        text_lines.append(idx_docid_mapping[doc_id]['lines'][end_line])
+        end_line += 1
+    text = "\n".join(text_lines)
+    return DocWindow(doc_id = doc_id, start_line=start_line, text=text, end_line = end_line, total_lines=totallines)
