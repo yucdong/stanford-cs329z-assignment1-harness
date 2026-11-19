@@ -38,7 +38,7 @@ from typing import Any, Callable, Optional, Tuple
 
 import cs329z_hw1
 from cs329z_hw1 import tokenizer
-from cs329z_hw1.cardinal import CARDINAL_SPECS, USER_SPECS, MEMORY_DIR_SPECS
+from cs329z_hw1.cardinal import CARDINAL_SPECS, USER_SPECS, MEMORY_DIR_SPECS, make_terminal_tool
 from cs329z_hw1.llm import OutputTruncated
 from cs329z_hw1.tokens import CHARS_PER_TOKEN, count_message_tokens, count_tokens
 from cs329z_hw1.types import (
@@ -397,7 +397,7 @@ def run_render_tools(schemas: list[dict]) -> str:
     requests in tests/fixtures/agent_protocol_requests.json.
     """
     tools_prompt = json.dumps(schemas, ensure_ascii=False, indent=2)
-    
+
     return f'''
     Here are the available tools, their descriptions and their parameters:
     {tools_prompt},
@@ -406,7 +406,15 @@ def run_render_tools(schemas: list[dict]) -> str:
     {{"name": "search", "args": {{"query": "meeting tomorrow", "limit": 5, "enabled": true, "filter": null}}}}
     </tool_call>
 
-    do not write multiple tool calls in one reply and keep the xml tag and args json payload intact
+    do not write multiple tool calls in one reply and keep the xml tag and args json payload intact.
+    If you need to inspect data or perform a calculation, emit a tool call
+    in this reply. Do not reply only with a promise such as "I'll check".
+
+    Tools run only when you output the literal <tool_call> JSON format below.
+    Describing a command does not execute it.
+
+    A reply without a tool call is treated as your final answer.
+    For archive statistics, obtain the result from a tool before answering.
     '''
 
 
@@ -721,7 +729,12 @@ def run_agent_session(
       the deny rules.
     """
     if tools is None:
-        tools = CARDINAL_SPECS
+        tools = [
+            make_terminal_tool(config)
+            if spec.name == 'run_terminal'
+            else spec
+            for spec in CARDINAL_SPECS
+        ]
     else:
         if config.user is not None:
             tools.extend(USER_SPECS)
