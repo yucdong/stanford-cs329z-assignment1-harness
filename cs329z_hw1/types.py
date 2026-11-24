@@ -46,6 +46,7 @@ class Index(UserDict):
     # store [term -> dict[docid, count]] for each token
     def __init__(self, docs: list[str]):
         self.document_count = len(docs)
+        self.next_doc_id = len(docs)
         self.document_lengths = dict[int, int]()
         super().__init__()
         for idx, doc in enumerate(docs):
@@ -56,6 +57,19 @@ class Index(UserDict):
                     self.data[token] = defaultdict[int, int](int)
                 self.data[token][idx] += 1
         self.avg_doc_len = sum(self.document_lengths.values()) / self.document_count if self.document_count > 0 else 0
+
+    def add_document(self, doc: str) -> int:
+        tokens = tokenizer.tokenize(doc)
+        doc_id = self.next_doc_id
+        self.document_lengths[doc_id] = len(tokens)
+        for token in tokens:
+            if token not in self.data:
+                self.data[token] = defaultdict(int)
+            self.data[token][doc_id] += 1
+        self.document_count += 1
+        self.avg_doc_len = sum(self.document_lengths.values()) / self.document_count if self.document_count > 0 else 0
+        self.next_doc_id = max(self.document_lengths.keys(), default=-1) + 1
+        return doc_id
 
     def __missing__(self, key: str):
         return defaultdict(int)

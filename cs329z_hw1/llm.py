@@ -18,6 +18,9 @@ What the wrapper does for you:
 * Cost ledger. Every call that reaches the provider is appended to
   ``.lm_cache/ledger.jsonl`` with its token counts and dollar cost.
   ``uv run python -m cs329z_hw1.llm`` prints a spending report.
+* Response diagnostics. Uncached calls record SDK response objects and streaming
+  events in ``raw_responses.jsonl`` beside the ledger, before text conversion.
+  ``last_response`` exposes the current call's record (None for cache hits).
 * Budget stop. If ``CS329Z_BUDGET_USD`` is set, the wrapper raises
   ``BudgetExceeded`` instead of making a call once the ledger total passes it.
 * Truncation. A call that stops because the model reached ``max_tokens``
@@ -43,6 +46,7 @@ import os
 import re
 import threading
 import time
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -295,10 +299,14 @@ class LM:
         self.cost_usd = 0.0
         self.seconds = 0.0
         self._client = None
+        self.last_response: dict | None = None
+        self._response_attempt: dict | None = None
 
     # -- public API -------------------------------------------------------
 
     def __call__(self, messages: Sequence[Message]) -> str:
+        self.last_response = None
+        self._response_attempt = None
         _validate_messages(messages)
         messages = [{"role": m["role"], "content": m["content"]} for m in messages]
         key = self._key(messages)
@@ -312,7 +320,20 @@ class LM:
 
         self._check_budget()
         start = time.time()
-        text, usage = self._complete(messages)
+        self.last_response = {
+            "call_id": uuid4().hex, "ts": round(start, 3),
+            "model": self.model, "backend": self.backend, "api_type": self.api_type,
+            "tag": self.tag or os.environ.get("CS329Z_TAG", ""), "attempts": [],
+        }
+        try:
+            text, usage = self._complete(messages)
+            self.last_response.update(text=text, usage=usage)
+        except Exception as exc:
+            self.last_response["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            self._response_attempt = None
+            self._record_response()
         elapsed = time.time() - start
         self.response_model = usage.get("response_model", self.model)
         cost = usage.get("cost")
@@ -347,6 +368,7 @@ class LM:
                 "cost_source": cost_source,
                 "seconds": round(elapsed, 3),
                 "finish_reason": usage.get("finish_reason"),
+                "call_id": self.last_response["call_id"],
             },
             self._cache_directory,
         )
@@ -383,6 +405,18 @@ class LM:
         }
 
     # -- internals --------------------------------------------------------
+
+    def _record_response(self) -> None:
+        """Keep diagnostics even when parsing fails; never mask the call's result."""
+        path = self._cache_directory / "raw_responses.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = json.dumps(self.last_response, ensure_ascii=False)
+            with _ledger_lock:
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(record + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            self.last_response["logging_error"] = f"{type(exc).__name__}: {exc}"
 
     def _key(self, messages: list[Message]) -> str:
         blob = json.dumps(
@@ -490,6 +524,8 @@ class LM:
         # Errors can arrive during iteration, not just during create().
         with self._client.responses.create(**kwargs) as stream:
             for event in stream:
+                if self._response_attempt is not None:
+                    self._response_attempt["events"].append(event.model_dump(mode="json", warnings=False))
                 if event.type == "error":
                     raise _ResponsesError(event.model_dump(), retryable=not output_seen)
                 if event.type == "response.failed":
@@ -517,9 +553,16 @@ class LM:
         # Each removal can happen only once. Never drop the output limit or
         # retry a stream that has already started producing output.
         while True:
+            attempt = {"events": []}
+            self._response_attempt = attempt
+            if self.last_response is not None:
+                self.last_response["attempts"].append(attempt)
             try:
-                return request(**kwargs)
+                response = request(**kwargs)
+                attempt["response"] = response.model_dump(mode="json", warnings=False)
+                return response
             except Exception as exc:
+                attempt["error"] = f"{type(exc).__name__}: {exc}"
                 parameter = _unsupported_parameter(exc)
                 reasoning_options = kwargs.get("extra_body", kwargs)
                 if parameter == "temperature" and "temperature" in kwargs:
