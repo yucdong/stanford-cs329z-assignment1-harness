@@ -129,6 +129,9 @@ class ToolRegistry:
              return ToolResult(status="tool_error", content=str(e))
       else:
          return validate_result
+      
+    def get_tool_spec(self, name):
+        return self.tools.get(name)
 
 @dataclass
 class ParsedResponse:

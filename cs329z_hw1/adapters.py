@@ -588,7 +588,7 @@ class AgentSession:
 
         self.messages = []
         self._message_sources = []
-        self.mode = "auto"
+        self.mode = config.mode
 
     def close(self) -> None:
         """Release this session's lease on local memory (safe to call twice)."""
@@ -879,17 +879,33 @@ class AgentSession:
                 self.transcript.append({
                     "type": "tool_call", "name": call.name, "args": deepcopy(call.args)
                 })
-                tool_result = self.tool_registry.execute(call.name, call.args)
-                try:
-                    feedback = self._bound_feedback(tool_result.content, current_user, f"tool_result {call.name} status={tool_result.status}")
-                except _CompactionUnavailable as exc:
-                    return finish("token_budget", f"Stopped during context compaction: {exc}")
-                self.transcript.append({
-                    "type": "tool_result", "name": call.name,
-                    "content": feedback, "status": tool_result.status,
-                })
-                self._append_message("user", feedback, "tool_result")
-                malformed = tool_result.status in ("unknown_tool", "invalid_args")
+                tool_allowed = True
+                if self.mode == "confirm":
+                    tool_validation = self.tool_registry.validate(call.name, call.args)
+                    malformed = tool_validation is not None and tool_validation.status in ("unknown_tool", "invalid_args")
+                    tool_spec = self.tool_registry.get_tool_spec(call.name)
+                    if tool_validation is None and tool_spec is not None and tool_spec.read_only == False:
+                        approval = self.config.user.approve(call)
+                        if approval.approved == False:
+                            feedback = self._bound_feedback(f"User denied the tool call: {approval.reason}", current_user, "tool_result")
+                            self.transcript.append({
+                                "type": "tool_result", "name": call.name, "content": f"User denied the tool call: {approval.reason}", "status": "denied"
+                            })
+                            self._append_message("user", f"User denied the tool call: {approval.reason}", "tool_result")
+                            tool_allowed = False
+
+                if tool_allowed:
+                    tool_result = self.tool_registry.execute(call.name, call.args)
+                    try:
+                        feedback = self._bound_feedback(tool_result.content, current_user, f"tool_result {call.name} status={tool_result.status}")
+                    except _CompactionUnavailable as exc:
+                        return finish("token_budget", f"Stopped during context compaction: {exc}")
+                    self.transcript.append({
+                        "type": "tool_result", "name": call.name,
+                        "content": feedback, "status": tool_result.status,
+                    })
+                    self._append_message("user", feedback, "tool_result")
+                    malformed = tool_result.status in ("unknown_tool", "invalid_args")
             else:
                 return finish("done", parsed_response.text)
 
