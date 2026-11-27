@@ -38,7 +38,7 @@ from typing import Any, Callable, Optional, Tuple
 
 import cs329z_hw1
 from cs329z_hw1 import tokenizer
-from cs329z_hw1.cardinal import CARDINAL_SPECS, USER_SPECS, MEMORY_DIR_SPECS, make_terminal_tool, cardinal_spec
+from cs329z_hw1.cardinal import CARDINAL_SPECS, USER_SPECS, MEMORY_DIR_SPECS, make_ask_user_tool, make_terminal_tool, cardinal_spec
 from cs329z_hw1.llm import OutputTruncated
 from cs329z_hw1.tokens import CHARS_PER_TOKEN, count_message_tokens, count_tokens
 from cs329z_hw1.memory import MemoryHandle, format_memories
@@ -1077,6 +1077,7 @@ def run_agent_session(
       "run_terminal": make_terminal_tool,
       "remember": make_remember_tool,
       "recall": make_recall_tool,
+      "ask_user": make_ask_user_tool,
     }
 
     if tools is None:
@@ -1088,7 +1089,7 @@ def run_agent_session(
       ]
     else:
         if config.user is not None:
-            tools.extend(USER_SPECS)
+            tools.extend([make_ask_user_tool(config)])
         if config.memory_dir is not None:
             tools.extend([make_remember_tool(config), make_recall_tool(config)])
     return AgentSession(lm, tools, config)

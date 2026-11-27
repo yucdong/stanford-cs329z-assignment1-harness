@@ -226,6 +226,17 @@ Commands run in Bash. Here-documents (<<) are not supported.''',
         execute,
     )
 
+def make_ask_user_tool(config: AgentConfig) -> ToolSpec:
+    def execute(question: str):
+        answer = config.user.ask(question)
+        return answer
+
+    return cardinal_spec(
+        "ask_user",
+        '''Use this tool to ask the user a question to clarify things when a request is ambiguous.''',
+        execute,
+    )
+
 def get_doc_index():
     """Load and build the shared document index on the first tool call."""
     global _doc_index
