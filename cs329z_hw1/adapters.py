@@ -828,6 +828,13 @@ class AgentSession:
 
             # Count the exact messages sent, including the system prompt.
             try:
+                
+                # steering, add pending message
+                pending_message = self.config.user.pending_message()
+                if pending_message:
+                    self.transcript.append({"type": "user", "content": pending_message})
+                    current_user = self._append_message("user", pending_message, "user_request")
+
                 messages = self._prepare_context(current_user)
             except _CompactionUnavailable as exc:
                 return finish("token_budget", f"Stopped during context compaction: {exc}")
